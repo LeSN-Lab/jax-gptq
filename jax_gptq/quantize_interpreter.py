@@ -3,12 +3,13 @@ from copy import deepcopy
 from functools import partial, reduce
 import numpy as np
 import warnings
-
+import re
 import jax
 import jax.numpy as jnp
 from jax._src.core import Literal
 from jax.util import safe_map
 from tqdm import tqdm
+import re
 
 from .gptq import gptq, pack_matrix, QuantizedMatrix
 
@@ -31,7 +32,8 @@ def quantize(
     damping=0.01,
     use_quantized_activations=True,
     use_fp64=False,
-    use_params_fp32=False
+    use_params_fp32=False,
+    exclude_layers=None,
 ):
     """
     Run the GPT-Q algorithm on a function to produce quantized versions of its parameters
@@ -72,7 +74,8 @@ def quantize(
         damping=damping,
         use_quantized_activations=use_quantized_activations,
         use_fp64=use_fp64,
-        use_params_fp32=use_params_fp32
+        use_params_fp32=use_params_fp32,
+        exclude_layers=exclude_layers
     )
     for ind, quantized_param in result.items():
         param_args[ind] = quantized_param
@@ -99,7 +102,7 @@ def _get_delete_points(jaxpr):
 
 def _maybe_delete(val):
     if not val.is_deleted():
-        val.device_buffer.delete()
+        val.addressable_data(0).delete()
 
 def _eval_and_quantize(
     jaxpr,
@@ -111,23 +114,29 @@ def _eval_and_quantize(
     damping=0.01,
     use_quantized_activations=True,
     use_fp64=False,
-    use_params_fp32=False
+    use_params_fp32=False,
+    exclude_layers=None  # 새로운 인자: 양자화에서 제외할 레이어 목록
 ):
+    # CPU와 GPU 디바이스 설정
     cpu = jax.devices('cpu')[0]
     gpu = jax.devices('gpu')[0]
     # Args are all either params or lists of tensors
-
+    # 결과를 저장할 딕셔너리 초기화
     quantized_results = {}
     name_to_pos = {}
-
+    
+    # 배치 수 계산
     n_batches = len(next(a for i, a in enumerate(args) if i not in argnums))
 
+    # GPU에서 사용할 환경 초기화
      # Everything in here should be on GPU
     envs = [{} for _ in range(n_batches)]
 
     # Map from var name to a tuple of value, original_name, and a stack of transformations to map it back to orig param shape
+    # 파라미터 환경 초기화: 변수 이름에 대한 (값, 원래 이름, 변환 스택) 매핑
     param_env = {}
 
+    # 입력 인자 처리
     for index, name in enumerate(jaxpr.invars):
         if index in argnums:
             param_env[name] = (args[index], name, ())
@@ -135,31 +144,38 @@ def _eval_and_quantize(
         else:
             for i in range(n_batches):
                 envs[i][name] = args[index][i]
-
+    # 메모리 해제 함수 정의
     def delete(name):
         if name not in envs[0]:
             return
         for env in envs:
-            env[name].device_buffer.delete()
+            env[name].addressable_data(0).delete()
             del env[name]
 
+    # 삭제 지점 계산
     delete_points = _get_delete_points(jaxpr)
 
+    # 상수 환경 설정
     const_env = {name: val for name, val in zip(jaxpr.constvars, consts)}
+    
+    # 메인 루프 시작
     pos = 0
     bar = tqdm(desc='Quantizing')
     while True:
         bar.update(1)
+        # 다음 행렬 곱셈 연산 찾기
         next_pos, needed_names, matmul_handler, updated_param_env = update_params_to_next_matmul(
             eqns=jaxpr.eqns,
             start_pos=pos,
             delete_points=delete_points,
             param_env=param_env,
-            env=envs[0]
+            env=envs[0],
+            exclude_layers=exclude_layers
         )
         if next_pos is None:
             break
-
+        
+        # 필요한 파라미터를 GPU로 이동
         block_param_env = {
             name: jax.device_put(param_env[name][0], gpu)
             for name in needed_names if name in param_env
@@ -172,7 +188,7 @@ def _eval_and_quantize(
         print(f'Current env size: {tree_size_bytes(envs):.2e} bytes')
         print(f'Current param env size: {tree_size_bytes(block_param_env):.2e} bytes')
         delete_keys = set(var for i in range(pos, next_pos) for var in delete_points[i])
-
+        # 세그먼트 실행
         segment_eqns = jaxpr.eqns[pos:next_pos]
 
         # If a parameter has been transformed keep it in the param env instead of the individual envs
@@ -187,24 +203,28 @@ def _eval_and_quantize(
             #envs[i] = jax.device_put(new_env, cpu)
             #jax.tree_map(_maybe_delete, (gpu_env, new_env))
 
-
+        # 메모리 정리
         for param in block_param_env.values():
-            param.device_buffer.delete()
+            param.addressable_data(0).delete()
 
         del block_param_env
 
         param_env = updated_param_env
 
         #(jax.device_put(0., gpu) + 0).block_until_ready()
-
+        # 행렬 곱셈 연산 처리
         matmul_eqn = jaxpr.eqns[next_pos]
 
         all_args = []
         if sum(argname in param_env for argname in matmul_eqn.invars) > 1:
             raise NotImplementedError('Currently only one quantize target is supported per op')
-
+         
+         # 양자화 대상 확인
         quantize_argname = next(argname for argname in matmul_eqn.invars if argname in param_env)
 
+
+        # 인자 준비
+        
         for argname in matmul_eqn.invars:
             if argname in param_env:
                 all_args.append(param_env[argname][0])
@@ -212,32 +232,64 @@ def _eval_and_quantize(
                 all_args.append([env[argname] for env in envs])
         all_args = [jax.device_put(arg, gpu) for arg in all_args]
 
+
+
+        
         handler_coro = matmul_handler(all_args)
 
-        w, xs = next(handler_coro)
+        w, xs = next(handler_coro)        
+        #양자화 여부 결정
+        # print(exclude_layers)
+        should_quantize = True
+        if exclude_layers:
+            print("exclude_layers :", exclude_layers)
+            for layer_pattern in exclude_layers:
+                if re.match(layer_pattern, str(matmul_eqn), re.DOTALL):    
+                    should_quantize = False
+                    break
 
-        quantized_w, quantize_params = gptq(
-            W=w,
-            xs=xs,
-            block_size=block_size,
-            actorder=actorder,
-            damping=damping,
-            use_fp64=use_fp64
-        )
+        # 양자화 수행 또는 건너뛰기
+        if should_quantize:
+            # print("해당 layer가 exclude_layer에 속하면 양자화하지 않습니다. : ", str(matmul_eqn))
+            quantized_w, quantize_params = gptq(
+                W=w,
+                xs=xs,
+                block_size=block_size,
+                actorder=actorder,
+                damping=damping,
+                use_fp64=use_fp64
+            )
+        else:
+            print("양자화안됨")
+            quantized_w = w
+            quantize_params = {'scale': jnp.ones_like(w), 'zero' : jnp.zeros_like(w)}
         assert quantized_w.shape == w.shape
-
+        #결과 처리
         try:
-            handler_coro.send((quantized_w, quantize_params['scale'], quantize_params['zero']))
+            if matmul_eqn.primitive.name == 'conv_general_dilated':
+                handler_coro.send((w, xs))
+                # next(handler_coro)
+                handler_coro.send((quantized_w, quantize_params['scale'], quantize_params['zero'], should_quantize))
+            else:
+                # next(handler_coro)
+                # handler_coro.send((w, xs))
+                handler_coro.send((quantized_w, quantize_params['scale'], quantize_params['zero']))
             assert False, 'Handler should have stopped'
+
         except StopIteration as e:
             quantized_w, quantize_params['scale'], quantize_params['zero'], contraction_axis = e.value
 
+        #이 줄은 현재 연산의 출력 변수를 설정합니다.
         outvars = jaxpr.eqns[next_pos].outvars
-
+        #양자화 대상이 아닌 입력 변수의 인덱스를 저장합니다.
         delete_indices = [i for i, name in enumerate(matmul_eqn.invars) if name != quantize_argname]
+
+
 
         do_eval = jax.jit(partial(eval_eqn, matmul_eqn))
 
+        
+        #양자화된 가중치를 준비하고 GPU로 이동시킵니다.
         matmul_w_arg = quantized_w if use_quantized_activations else param_env[quantize_argname][0]
         if use_params_fp32:
             matmul_w_arg = matmul_w_arg.astype(jnp.float32)
@@ -245,6 +297,7 @@ def _eval_and_quantize(
         matmul_w_arg = jax.device_put(matmul_w_arg, gpu)
 
         for env in envs:
+            #GPU인자 준비
             gpu_args = [
                 matmul_w_arg
                 if argname == quantize_argname else
@@ -252,27 +305,31 @@ def _eval_and_quantize(
                 for argname in matmul_eqn.invars
             ]
             gpu_args = jax.device_put(gpu_args, gpu)
+            
+            #연산 수행
             results = do_eval(*gpu_args)
 
+            #대용량 결과 처리
             if tree_size_bytes(results) > 1e8:
                 # This should offload stuff like the final logits to the CPU
+                #CPU로 오프로드
                 cpu_results = jax.device_put(results, cpu)
-                jax.tree_map(lambda x: x.is_deleted() or x.device_buffer.delete(), results)
+                jax.tree_map(lambda x: x.is_deleted() or x.addressable_data(0).delete(), results)
                 results = cpu_results
-
+            #결과 저장
             if matmul_eqn.primitive.multiple_results:
                 for outvar, value in zip(outvars, results):
                     env[outvar] = value
             else:
                 env[outvars[0]] = results
-
+            # 불필요한 데이터 삭제
             for name in delete_points[next_pos]:
                 if name in env:
                     _maybe_delete(env[name])
                     del env[name]
 
             #for i in delete_indices:
-            #    gpu_args[i].device_buffer.delete()
+            #    gpu_args[i].addressable_data(0).delete()
             #(jax.device_put(0., gpu) + 0).block_until_ready()
 
         #for name in delete_points[next_pos]:
@@ -289,25 +346,42 @@ def _eval_and_quantize(
             if quantize_argname not in delete_points[next_pos]:
                 cpu_quantized_w = jax.device_put(quantized_w, cpu)
                 param_env[quantize_argname] = cpu_quantized_w, orig_name, inv_transforms
-            orig_w.device_buffer.delete()
+            orig_w.addressable_data(0).delete()
         elif quantize_argname in delete_points[next_pos]:
-            orig_w.device_buffer.delete()
+            orig_w.addressable_data(0).delete()
             del param_env[quantize_argname]
 
-        quantized_w.device_buffer.delete()
+        quantized_w.addressable_data(0).delete()
         #(jax.device_put(0., gpu) + 0).block_until_ready()
         pos = next_pos + 1
 
     return quantized_results
 
-def update_params_to_next_matmul(eqns, start_pos, delete_points, param_env, env):
+def update_params_to_next_matmul(eqns, start_pos, delete_points, param_env, env, exclude_layers=None):
+    # eqns: JAX의 방정식(연산) 목록
+    # start_pos: 시작 위치
+    # delete_points: 메모리 최적화를 위한 삭제 지점
+    # param_env: 파라미터 환경
+    # env: 실행 환경
+    # exclude_layers: 양자화에서 제외할 레이어 패턴 목록
+    """
+    이 수정된 update_params_to_next_matmul 함수는 exclude_layers를 사용하여 특정 레이어를 양자화에서 제외할 수 있게 해줍니다.
+    또한 should_quantize 플래그를 도입하여 각 연산에 대해 양자화 여부를 동적으로 결정하고, 이 정보를 핸들러에 전달합니다.
+    이를 통해 모델의 특정 부분은 양자화하지 않고 원래의 정밀도를 유지할 수 있게 됩니다.
+    """
+    # 새로운 파라미터 환경 복사
     new_param_env = {k: v for k, v in param_env.items()}
+    # 환경 내 변수들의 shape와 dtype 정보 추출
     env_shapes = {k: jax.ShapeDtypeStruct(v.shape, v.dtype) for k, v in env.items()}
-
+    # 필요한 변수 이름들을 추적하기 위한 집합
     needed_names = set()
+    
+    # 주어진 방정식들을 순회
     for i, eqn in enumerate(eqns[start_pos:], start_pos):
         invars = eqn.invars
         op_name = eqn.primitive.name
+        # 파라미터 변환 연산 처리
+
         if op_name in PARAM_TRANSFORMS:
             arg, = invars
             needed_names.add(arg)
@@ -322,21 +396,32 @@ def update_params_to_next_matmul(eqns, start_pos, delete_points, param_env, env)
                 else:
                     warnings.warn(f'Transformation `{op_name}` is applied to a target parameter of shape {new_param_env[arg][0].shape} which is later reused. This may lead to this parameter not being quantized, or it being quantized poorly.')
                 continue
-
+            
+        # 인자 shape 정보 추출
         arg_shapes = [invar.aval for invar in invars]
 
+        # 각 인자가 양자화 대상인지 확인
         args_are_targets = [(
             False if isinstance(v, Literal) else
             (v in new_param_env and len(new_param_env[v][0].shape) > 1)
         ) for v in invars]
 
+        # 양자화 대상 연산 처리
         if any(args_are_targets):
             if op_name == 'pjit':
                 warnings.warn(f'Quantization does not descend into pjit')
             if op_name in PRIMITIVE_TO_MATMUL:
                 predicate, handler = PRIMITIVE_TO_MATMUL[op_name]
                 if predicate(eqn, args_are_targets, arg_shapes):
-                    return i, needed_names, partial(handler, eqn, args_are_targets), new_param_env
+                    # 양자화 여부 결정
+                    should_quantize = True
+                    if exclude_layers:
+                        for layer_pattern in exclude_layers:
+                            if re.match(layer_pattern, str(eqn), re.DOTALL):
+                                should_quantize = False
+                                break
+                    # 결과 반환: 위치, 필요한 이름들, 핸들러 (should_quantize 포함), 새 파라미터 환경
+                    return i, needed_names, partial(handler, eqn, args_are_targets, should_quantize), new_param_env
             else:
                 warnings.warn(f'Operation {eqn.primitive.name} not supported for quantization')
 
@@ -407,7 +492,7 @@ def to_original_shape(w, shape, restore_permutation):
         restore_permutation
     )
 
-def handle_dot_general(eqn, args_are_targets, args):
+def handle_dot_general(eqn, args_are_targets, should_quantize, args):
     lhs, rhs = args
     ((lhs_contract,), (rhs_contract,)), _ = eqn.params['dimension_numbers']
     if args_are_targets[0]:
@@ -436,7 +521,10 @@ def handle_dot_general(eqn, args_are_targets, args):
         prepared_xs.append(x)
 
     quantized_w, scales, zeros = yield w, prepared_xs
-
+    
+    if not should_quantize:
+        quantized_w, scales, zeros = w, jnp.ones_like(w), jnp.zeros_like(w)
+        
     if w_permutation:
         unpermute = tuple(np.argsort(w_permutation))
         shape = tuple(orig_w_shape[i] for i in w_permutation)
@@ -484,19 +572,31 @@ def conv_predicate(eqn, args_are_targets, args):
 
     return True
 
-def handle_conv(eqn, args_are_targets, args):
+def handle_conv(eqn, args_are_targets, should_quantize, args):
+    # eqn: 현재 처리 중인 convolution 연산
+    # args_are_targets: 각 인자가 양자화 대상인지 여부
+    # should_quantize: 이 특정 convolution을 양자화해야 하는지 여부
+    # args: convolution 연산의 입력 인자들
     inps, kernel = args
     inp_shape = inps[0].shape
     kernel_shape = kernel.shape
 
-    (inp_batch_dim, inp_feature_dim, inp_spatial_dims), (kernel_out_dim, kernel_in_dim, *kernel_spatial_dims), _ = eqn.params['dimension_numbers']
+    # convolution의 차원 정보 추출
+    # (inp_batch_dim, inp_feature_dim, inp_spatial_dims), (kernel_out_dim, kernel_in_dim, *kernel_spatial_dims), _ = eqn.params['dimension_numbers']
+    dim_numbers = eqn.params['dimension_numbers']
+    inp_dims, kernel_dims, out_dims = dim_numbers[:3]
+    inp_batch_dim, inp_feature_dim, *inp_spatial_dims = inp_dims
+    kernel_out_dim, kernel_in_dim, *kernel_spatial_dims = kernel_dims
 
+    # 커널을 2D 행렬로 변환
     flat_kernel = jnp.squeeze(kernel, kernel_spatial_dims)
 
+    # 필요한 경우 커널 전치
     needs_transpose = kernel_out_dim < kernel_in_dim
     if needs_transpose:
         flat_kernel = flat_kernel.T
 
+    # 입력 텐서 준비
     inp_permutation = None
     if inp_feature_dim != len(inp_shape) - 1:
         inp_permutation = tuple([*(i for i in range(len(inp_shape)) if i != inp_feature_dim), inp_feature_dim])
@@ -506,17 +606,38 @@ def handle_conv(eqn, args_are_targets, args):
         if inp_permutation is not None:
             inp = permute_to_matrix(inp, inp_permutation, False)
         prepared_inps.append(inp)
+        
+    # 첫 번째 yield: 평탄화된 커널과 준비된 입력 반환
+    flat_kernel, prepared_inps = yield flat_kernel, prepared_inps
 
-    quantized_kernel, scales, zeros = yield flat_kernel, prepared_inps
+    # 양자화 수행 여부 결정
+    if should_quantize:
+        # 두 번째 yield: 양자화된 커널, 스케일, 제로 포인트 획득
+        quantized_kernel, scales, zeros, should_quantize = yield
+    else:
+        # 양자화하지 않는 경우, 원본 값 사용
+        quantized_kernel, scales, zeros = flat_kernel, jnp.ones_like(flat_kernel), jnp.zeros_like(flat_kernel)
 
+    
     if needs_transpose:
         quantized_kernel = quantized_kernel.T
+        scales = scales.T
+        zeros = zeros.T
+        
+    print("현재 should_quantize 상태", should_quantize )
+    
+    if should_quantize:
+        for dim in sorted(kernel_spatial_dims):
+            quantized_kernel = jnp.expand_dims(quantized_kernel, dim)
+            scale_dim = dim if dim < inp_feature_dim else dim - 1
+            scales = jnp.expand_dims(scales, scale_dim)
+            zeros = jnp.expand_dims(zeros, scale_dim)
+    else:
+        # 원본 커널 shape로 복원
+        quantized_kernel = kernel
+        scales = jnp.ones_like(kernel)
+        zeros = jnp.zeros_like(kernel)
 
-    for dim in sorted(kernel_spatial_dims):
-        quantized_kernel = jnp.expand_dims(quantized_kernel, dim)
-        scale_dim = dim if dim < inp_feature_dim else dim - 1
-        scales = jnp.expand_dims(scales, scale_dim)
-        zeros = jnp.expand_dims(zeros, scale_dim)
 
     return quantized_kernel, scales, zeros, kernel_in_dim
 
@@ -527,7 +648,7 @@ def eval_eqn(eqn, *args):
 
 PRIMITIVE_TO_MATMUL = {
     'dot_general': (dot_general_predicate, handle_dot_general),
-    'conv_general_dilated': (conv_predicate, handle_conv)
+    'conv_general_dilated': (conv_predicate, lambda eqn, args_are_targets, should_quantize, args: handle_conv(eqn, args_are_targets, should_quantize, args))
 }
 
 def inverse_transpose(eqn, arg):

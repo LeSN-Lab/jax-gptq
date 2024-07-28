@@ -1,7 +1,9 @@
 from collections import namedtuple
 from contextlib import nullcontext
 from functools import partial, wraps
-
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 import jax
 import jax.numpy as jnp
 

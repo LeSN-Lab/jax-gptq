@@ -125,7 +125,7 @@ def eval_with_quantized(eqn, args, use_kernel=False):
     """
     if not jax.tree_util.tree_all(
         jax.tree_map(
-            lambda x: x.device_buffer.device().platform == 'gpu',
+            lambda x: x.addressable_data(0).device().platform == 'gpu',
             (lhs, rhs)
         )
     ):
