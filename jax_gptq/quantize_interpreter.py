@@ -565,6 +565,7 @@ def conv_predicate(eqn, args_are_targets, args):
     kernel_spatial_dims = params['dimension_numbers'][1][2:]
 
     kernel_shape = args[1].shape
+    print("conv_predicate 568:", kernel_shape)
     for spatial_dim in kernel_spatial_dims:
         if kernel_shape[spatial_dim] != 1:
             warnings.warn('Currently only quantizing convs with 1x..x1 kernels are supported')
@@ -580,7 +581,7 @@ def handle_conv(eqn, args_are_targets, should_quantize, args):
     inps, kernel = args
     inp_shape = inps[0].shape
     kernel_shape = kernel.shape
-
+    print("handle_conv 584 kernel_shape:", kernel_shape)
     # convolution의 차원 정보 추출
     # (inp_batch_dim, inp_feature_dim, inp_spatial_dims), (kernel_out_dim, kernel_in_dim, *kernel_spatial_dims), _ = eqn.params['dimension_numbers']
     dim_numbers = eqn.params['dimension_numbers']
