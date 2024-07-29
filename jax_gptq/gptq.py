@@ -285,6 +285,9 @@ def pack_along_axis(axis, w):
     return vmap_all_but_one(_pack, axis)(w)
 
 def unpack_along_axis(axis, w):
+    if w.dtype == jnp.float32:
+        #float32 타입인 경우 언패킹을 하지 않고 그대로 반환한다.
+        return w
     return vmap_all_but_one(_unpack, axis)(w)
 
 pack_rowwise = jax.vmap(_pack)
