@@ -54,14 +54,7 @@ def use_quantized(f, static_argnums=(), use_kernel=False, remat_unpack=False):
             use_kernel=use_kernel,
             remat_unpack=remat_unpack
         )
-        # return jax.tree_util.tree_unflatten(output_struct, result)
-        #양자화되지 않은 레이어를 처리할 때 형태를 올바르게 유지하도록 합니다.
-        return jax.tree_util.tree_map(
-            lambda x, y: x.reshape(y.shape) if isinstance(x, jnp.ndarray) else x,
-            jax.tree_util.tree_unflatten(output_struct, result),
-            jax.eval_shape(f_with_static_args, *dynamic_shape_args, **shape_kwargs)
-        )
-
+        return jax.tree_util.tree_unflatten(output_struct, result)
 
     return inner
 
@@ -97,27 +90,6 @@ def eval_jaxpr_with_quantized_args(jaxpr, consts, *args, use_kernel=False, remat
     return safe_map(read, jaxpr.outvars)
 
 def eval_with_quantized(eqn, args, use_kernel=False):
-    """
-    문제의 본질:
-    현재 코드는 양자화되지 않은 QuantizedMatrix (float32 타입)를 특별히 처리하지 않고 있습니다. 이로 인해 float32 타입의 QuantizedMatrix에 대해 불필요한 언패킹 시도가 발생하고, 이는 오류를 유발합니다.
-    해결 방안:
-    float32 타입의 QuantizedMatrix를 발견하면, 이를 즉시 원래의 float32 배열로 변환하고 일반적인 방식으로 연산을 수행합니다. 이는 양자화되지 않은 레이어를 효과적으로 처리할 수 있게 해줍니다.
-    변경의 이점:
-
-    양자화된 레이어와 양자화되지 않은 레이어가 혼합된 모델을 올바르게 처리할 수 있습니다.
-    float32 타입의 QuantizedMatrix에 대한 불필요한 언패킹 시도를 방지하여 오류를 예방합니다.
-    기존의 양자화된 레이어 처리 로직은 그대로 유지되어 호환성을 보장합니다.
-
-
-
-
-    """
-    if any(isinstance(arg, QuantizedMatrix) and arg.int_weight.dtype == jnp.float32 for arg in args):
-        # float32 QuantizedMatrix를 원래 값으로 변환
-        args = [arg.int_weight if isinstance(arg, QuantizedMatrix) and arg.int_weight.dtype == jnp.float32 else arg for arg in args]
-        subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
-        return eqn.primitive.bind(*subfuns, *args, **bind_params)
-
     if eqn.primitive.name == 'pjit':
         jaxpr = eqn.params['jaxpr']
         literals = jaxpr.literals

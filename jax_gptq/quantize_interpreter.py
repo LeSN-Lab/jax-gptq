@@ -77,6 +77,7 @@ def quantize(
         use_params_fp32=use_params_fp32,
         exclude_layers=exclude_layers
     )
+    print("in quantize, line 80, eval_and_quantize의 리턴, result :", result)
     for ind, quantized_param in result.items():
         param_args[ind] = quantized_param
 
@@ -261,8 +262,24 @@ def _eval_and_quantize(
             )
         else:
             print("양자화안됨")
+
+            def get_quantize_params(weight, bits=4):
+                params = {
+                    'maxq': 2 ** bits - 1,
+                }
+                xmin = jnp.minimum(0, jnp.min(weight))
+                xmax = jnp.maximum(0, jnp.max(weight))
+                xmin = jnp.where(xmin == 0, -1, xmin)
+                xmax = jnp.where(xmax == 0, 1, xmax)
+                params['scale'] = (xmax - xmin) / params['maxq']
+                params['zero'] = jnp.round(-xmin / params['scale'])
+
+                return params
             quantized_w = w
-            quantize_params = {'scale': jnp.ones_like(w), 'zero' : jnp.zeros_like(w)}
+            # quantize_params = {'scale': jnp.ones_like(w), 'zero' : jnp.zeros_like(w)}
+            get_col_quantize_params = jax.vmap(get_quantize_params, in_axes=1,
+                                               out_axes={'scale': 0, 'zero': 0, 'maxq': None})
+            quantize_params = get_col_quantize_params(w)
         assert quantized_w.shape == w.shape
         #결과 처리
         try:
@@ -273,7 +290,7 @@ def _eval_and_quantize(
             else:
                 # next(handler_coro)
                 # handler_coro.send((w, xs))
-                handler_coro.send((quantized_w, quantize_params['scale'], quantize_params['zero']))
+                handler_coro.send((quantized_w, quantize_params['scale'], quantize_params['zero'], should_quantize))
             assert False, 'Handler should have stopped'
 
         except StopIteration as e:
@@ -339,7 +356,7 @@ def _eval_and_quantize(
         orig_w, orig_name, inv_transforms = param_env[quantize_argname]
         write_arg = name_to_pos[orig_name]
         if write_arg not in quantized_results:
-            packed_result = pack_matrix(quantized_w, quantize_params, contraction_axis)
+            packed_result = pack_matrix(quantized_w, quantize_params, contraction_axis, should_quantize = should_quantize)
             un_transformed = reduce(lambda x, f: f(x), inv_transforms, packed_result)
             quantized_results[write_arg] = jax.device_put(un_transformed, cpu)
 
@@ -427,6 +444,7 @@ def update_params_to_next_matmul(eqns, start_pos, delete_points, param_env, env,
 
 
         out_shapes = jax.eval_shape(partial(eval_eqn, eqn), *arg_shapes)
+        print("update_params_to_next_matmul, 429line, => out_shape :", out_shapes)
         if not eqn.primitive.multiple_results:
             out_shapes = [out_shapes]
         safe_map(env_shapes.__setitem__, eqn.outvars, out_shapes)
@@ -520,10 +538,11 @@ def handle_dot_general(eqn, args_are_targets, should_quantize, args):
             x = permute_to_matrix(x, x_permutation, False)
         prepared_xs.append(x)
 
-    quantized_w, scales, zeros = yield w, prepared_xs
+    quantized_w, scales, zeros, should_quantize = yield w, prepared_xs
     
     if not should_quantize:
-        quantized_w, scales, zeros = w, jnp.ones_like(w), jnp.zeros_like(w)
+        # quantized_w, scales, zeros = w, jnp.ones_like(w), jnp.zeros_like(w)
+        quantized_w = w
         
     if w_permutation:
         unpermute = tuple(np.argsort(w_permutation))
@@ -565,7 +584,7 @@ def conv_predicate(eqn, args_are_targets, args):
     kernel_spatial_dims = params['dimension_numbers'][1][2:]
 
     kernel_shape = args[1].shape
-    print("conv_predicate 568:", kernel_shape)
+    print("in conv_predicate, line 569, => kernel_shape:", kernel_shape)
     for spatial_dim in kernel_spatial_dims:
         if kernel_shape[spatial_dim] != 1:
             warnings.warn('Currently only quantizing convs with 1x..x1 kernels are supported')
@@ -581,7 +600,9 @@ def handle_conv(eqn, args_are_targets, should_quantize, args):
     inps, kernel = args
     inp_shape = inps[0].shape
     kernel_shape = kernel.shape
-    print("handle_conv 584 kernel_shape:", kernel_shape)
+    
+    print("in handle_conv, line 586, => kernel_shape", kernel_shape)
+
     # convolution의 차원 정보 추출
     # (inp_batch_dim, inp_feature_dim, inp_spatial_dims), (kernel_out_dim, kernel_in_dim, *kernel_spatial_dims), _ = eqn.params['dimension_numbers']
     dim_numbers = eqn.params['dimension_numbers']
@@ -617,7 +638,9 @@ def handle_conv(eqn, args_are_targets, should_quantize, args):
         quantized_kernel, scales, zeros, should_quantize = yield
     else:
         # 양자화하지 않는 경우, 원본 값 사용
-        quantized_kernel, scales, zeros = flat_kernel, jnp.ones_like(flat_kernel), jnp.zeros_like(flat_kernel)
+        # quantized_kernel, scales, zeros = flat_kernel, jnp.ones_like(flat_kernel), jnp.zeros_like(flat_kernel)
+        quantized_kernel, scales, zeros, should_quantize = yield
+
 
     
     if needs_transpose:
@@ -627,17 +650,17 @@ def handle_conv(eqn, args_are_targets, should_quantize, args):
         
     print("현재 should_quantize 상태", should_quantize )
     
-    if should_quantize:
-        for dim in sorted(kernel_spatial_dims):
-            quantized_kernel = jnp.expand_dims(quantized_kernel, dim)
-            scale_dim = dim if dim < inp_feature_dim else dim - 1
-            scales = jnp.expand_dims(scales, scale_dim)
-            zeros = jnp.expand_dims(zeros, scale_dim)
-    else:
+    # if should_quantize:
+    for dim in sorted(kernel_spatial_dims):
+        quantized_kernel = jnp.expand_dims(quantized_kernel, dim)
+        scale_dim = dim if dim < inp_feature_dim else dim - 1
+        scales = jnp.expand_dims(scales, scale_dim)
+        zeros = jnp.expand_dims(zeros, scale_dim)
+    # else:
         # 원본 커널 shape로 복원
-        quantized_kernel = kernel
-        scales = jnp.ones_like(kernel)
-        zeros = jnp.zeros_like(kernel)
+        # quantized_kernel = kernel
+        # scales = jnp.ones_like(kernel)
+        # zeros = jnp.zeros_like(kernel)
 
 
     return quantized_kernel, scales, zeros, kernel_in_dim
@@ -666,6 +689,11 @@ def inverse_transpose(eqn, arg):
         ]
         new_scale = jax.lax.transpose(quantized_matrix.scale, permutation=unpermute_scale)
         new_zero = jax.lax.transpose(quantized_matrix.zero, permutation=unpermute_scale)
+        print("in inverse_transpose, line 673, QuantizedMatrix의 인자, new_int_weight", new_int_weight)
+        print("in inverse_transpose, line 673, QuantizedMatrix의 인자,new_scale ", new_scale)
+        print("in inverse_transpose, line 673, QuantizedMatrix의 인자,new_zero ", new_zero)
+        print("in inverse_transpose, line 673, QuantizedMatrix의 인자,new_contraction_axis ", new_contraction_axis)
+        
         return QuantizedMatrix(
             int_weight=new_int_weight,
             scale=new_scale,

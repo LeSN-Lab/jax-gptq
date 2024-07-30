@@ -1,253 +1,311 @@
-import triton
-import triton.language as tl
+from collections import namedtuple
+from contextlib import nullcontext
+from functools import partial, wraps
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+import jax
+import jax.numpy as jnp
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=8),
-    ],
-    key=['M', 'N', 'K']#, 'out_type']
+class QuantizedMatrix:
+    def __init__(self, int_weight, zero, scale, contraction_axis=0):
+        self.int_weight = int_weight
+        self.zero = zero
+        self.scale = scale
+        self.contraction_axis = contraction_axis
+
+    @property
+    def shape(self):
+        result = quant_matrix_shape(self)
+        # print("in gptq class QuantizedMatrix:def shape => result : ", result)
+        return result
+
+    @property
+    def dtype(self):
+        return self.zero.dtype
+
+jax.tree_util.register_pytree_with_keys(
+    QuantizedMatrix,
+    lambda x: ([
+        ('int_weight', x.int_weight),
+        ('zero', x.zero),
+        ('scale', x.scale),
+    ], x.contraction_axis),
+    lambda contraction_axis, xs: QuantizedMatrix(*xs, contraction_axis=contraction_axis),
 )
-@triton.jit
-def matmul_4bit_quantized(
-    # Pointers to inputs
-    a_ptr, b_ptr, zeros_ptr, scales_ptr,
-    # Pointers to outputs
-    c_ptr,
-    # Matrix dimensions
-    M, N, K,
-    # The stride variables represent how much to increase the ptr by when moving by 1
-    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
-    # by to get the element one row down (A has M rows).
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    """Adapted from from https://github.com/openai/triton/blob/main/python/tutorials/03-matrix-multiplication.py
-    Kernel for computing the matmul C = A x B, where B is an int32 matrix with each value consisting of 8 packed 4 bit values.
-    A has shape (M, K), B has shape (K // 8, N) and C has shape (M, N)
+
+def quant_matrix_shape(quantized_matrix, bits=4):
+    mat = quantized_matrix.int_weight
+    if mat.dtype == jnp.float32: # 양자화되지 않은 경우에도 올바른 형태를 반환하도록 수정합니다.
+        return mat.shape
+
+
+    ele_width = mat.dtype.itemsize * 8
+    contraction_dim = quantized_matrix.contraction_axis
+    shape = list(mat.shape)
+    shape[contraction_dim] *= ele_width // bits
+    # print("in gptq, def quant_matrix_shape line 44, : tuple(shape) : ", tuple(shape))
+    # print("in gptq, def quant_matrix_shape line 44, : quantized_matrix.int_weight.shape : ", tuple(quantized_matrix.int_weight.shape))
+    return tuple(shape)
+
+def _cholesky_inv(mat):
+    cho, upper = jax.scipy.linalg.cho_factor(mat)
+    hinv = jax.scipy.linalg.cho_solve((cho, upper), jnp.eye(mat.shape[0]))
+    hinv_cholesky = jnp.linalg.cholesky(hinv)
+    return hinv_cholesky
+    #return hinv
+
+@partial(jax.jit, static_argnums=(1,))
+def _calc_mean(xs, dtype):
+    means = [jnp.mean(x.astype(dtype).reshape(-1, x.shape[-1]), axis=0) for x in xs]
+    mean_of_means = jnp.mean(jnp.stack(means), axis=0)
+    return mean_of_means
+
+@partial(jax.jit, donate_argnums=(0,1,2))
+def _accumulate_H_step(H, running_mean, n_samples, batch):
+    if len(batch.shape) > 2:
+        batch = batch.reshape(-1, batch.shape[-1])
+
+    batch_size = batch.shape[0]
+    new_n_samples = n_samples + batch_size
+
+    batch = batch.astype(H.dtype)
+
+    new_mean = running_mean + jnp.sum(batch - running_mean, axis=0) / new_n_samples
+
+    x_val = batch - running_mean
+    y_val = batch - new_mean
+
+    H += x_val.T @ y_val
+
+    return H, new_mean, new_n_samples
+
+def accumulate_H(xs, use_fp64=False):
     """
-    VALS_PER_INT : tl.constexpr = 2
-    BLOCK_SIZE_BK : tl.constexpr = BLOCK_SIZE_K // VALS_PER_INT
-
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
-    # See above `L2 Cache Optimizations` section for details.
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K // 8, BLOCK_SIZE_N] pointers
-    # See above `Pointer Arithmetics` section for details
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_BK) * VALS_PER_INT
-    offs_bk = tl.arange(0, BLOCK_SIZE_BK)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    # Load zeros and scales
-    # Probably don't need to mask out of bounds vals since they should get masked in the matmul calc
-    block_zeros = tl.load(zeros_ptr + offs_bn[None, :])
-    block_scales = tl.load(scales_ptr + offs_bn[None, :])
-
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    BK = K // VALS_PER_INT
-
-    for block_num in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
-        b = tl.load(b_ptrs, mask=offs_bk[:, None] < BK - block_num * BLOCK_SIZE_BK, other=0)
-
-        a_subptrs = a_ptrs
-
-        for i in range(VALS_PER_INT):
-            b_slice = (b & 0xF).to(tl.float32)
-            b_slice -= block_zeros
-            b_slice *= block_scales
-
-            a_slice = tl.load(
-                a_subptrs,
-                mask=offs_k[None, :] < K - block_num * BLOCK_SIZE_K - i,
-                other=0.
-            ).to(tl.float32)
-
-            b = (b >> 4).to(tl.uint8)
-            a_subptrs += stride_ak
-
-            accumulator += tl.dot(a_slice, b_slice)
-
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_BK * stride_bk
-
-    c = accumulator.to(tl.float16)
+    The method here differs from the original GPT-Q implementation.
+    Instead of calculating the mean of XX^T directly, I instead calculate
+    the variance using a running approximation of the mean.
+    The second moment can then be recovered by adding the outer product
+    of the mean vector with itself. The factor of 2 from the original
+    paper doesn't matter since the algorithm is invariant to
+    scaling the Hessian.
     """
-    if out_type == 'float16':
-        c = accumulator.to(tl.float16)
-    elif out_type == 'float32':
-        c = accumulator
+
+    dtype = jnp.float64 if use_fp64 else jnp.float32
+    #feature_mean = _calc_mean(xs, dtype)
+
+    dim = xs[0].shape[-1]
+    #N = sum(x.shape[0] for x in xs)
+    H = jnp.zeros((dim, dim), dtype=dtype)
+    n_samples = jnp.zeros((), dtype)
+
+    running_mean = jnp.zeros(dim, dtype=dtype)
+
+    for batch in xs:
+        H, running_mean, n_samples = _accumulate_H_step(H, running_mean, n_samples, batch)
+
+    H /= n_samples
+    H += jnp.outer(running_mean, running_mean)
+
+    return H
+
+def get_quantize_params(weight, bits=4):
+    params = {
+        'maxq': 2**bits - 1,
+    }
+    xmin = jnp.minimum(0, jnp.min(weight))
+    xmax = jnp.maximum(0, jnp.max(weight))
+    xmin = jnp.where(xmin == 0, -1, xmin)
+    xmax = jnp.where(xmax == 0, 1, xmax)
+    params['scale'] = (xmax - xmin) / params['maxq']
+    params['zero'] = jnp.round(-xmin / params['scale'])
+
+    return params
+
+get_col_quantize_params = jax.vmap(get_quantize_params, in_axes=1, out_axes={'scale': 0, 'zero': 0, 'maxq': None})
+
+def quantize_value(zero, scale, maxq, value):
+    q = jnp.clip(
+        jnp.round(value / scale) + zero,
+        0,
+        maxq
+    )
+    return scale * (q - zero)
+
+batch_quantize = jax.vmap(quantize_value, (0, 0, None, 0))
+
+@partial(jax.jit, static_argnums=(4,))
+def _process_block(W, Hinv, start, quantize_params, block_size):
+    block = jax.lax.dynamic_slice_in_dim(W, start, block_size, axis=0)
+    h_block = jax.lax.dynamic_slice(Hinv, (start, start), (block_size, block_size))
+    quantized_rows = []
+    errors = []
+    for i in range(block_size):
+        w = block[i, :]
+        d = h_block[i, i]
+
+        q = batch_quantize(quantize_params['zero'], quantize_params['scale'], quantize_params['maxq'], w)
+        quantized_rows.append(q)
+
+        error = (w - q) / d
+        errors.append(error)
+
+        update = (h_block[i:, i:i+1] @ error[None, :]).astype(block.dtype)
+        block = block.at[i:, :].add(-update)
+
+    q_block = jnp.stack(quantized_rows, axis=0)
+
+    errors = jnp.stack(errors, axis=0)
+
+    return q_block, errors
+
+@partial(jax.jit, donate_argnums=(0, 1), static_argnums=2)
+def _damp_and_invert(W, H, damping):
+    dead = jnp.diag(H) == 0
+    H = jnp.where(jnp.diag(dead), 1, H)
+    W = jnp.where(dead[:, None], 0, W)
+
+    mean_diag = jnp.mean(jnp.diag(H))
+    positions = jnp.arange(H.shape[0])
+    H = H.at[positions, positions].add(mean_diag * damping)
+
+    Hinv = _cholesky_inv(H)
+    any_nan = jnp.any(jnp.isnan(Hinv))
+    #Hinv = jnp.linalg.inv(H)
+    return W, Hinv, any_nan
+
+@partial(jax.jit, donate_argnums=(0, 1))
+def _permute(W, H):
+    perm = jnp.argsort(jnp.diag(H))[::-1]
+    W = W[perm, :]
+    H = H[perm][:, perm]
+    return W, H, perm
+
+@partial(jax.jit, donate_argnums=(0,))
+def _unpermute(Q, perm):
+    invperm = jnp.argsort(perm)
+    return Q[invperm, :]
+
+def gptq(W, xs, block_size=128, actorder=False, damping=0.01, use_fp64=False):
+    orig_type = W.dtype
+    W = W.astype(jnp.float32)
+    quantize_params = get_col_quantize_params(W)
+    with (jax.experimental.enable_x64() if use_fp64 else nullcontext()):
+        H = accumulate_H(xs, use_fp64=use_fp64)
+
+        perm = None
+        if actorder:
+            W, H, perm = _permute(W, H)
+
+        W, Hinv, any_nan = _damp_and_invert(W, H, damping)
+        if any_nan:
+            xs_nan = any(jnp.any(jnp.isnan(x)) for x in xs)
+            raise ValueError('NaN when computing Hinv. Features NaN?: {xs_nan}')
+        Hinv = Hinv.astype(jnp.float32)
+
+    blocks = []
+    carry = W
+    for start in range(0, W.shape[0], block_size):
+        end = start + block_size
+        q_block, errors = _process_block(W, Hinv, start, quantize_params, block_size)
+        update = (Hinv[end:, start:end] @ errors).astype(W.dtype)
+        W = W.at[end:, :].add(-update)
+        blocks.append(q_block)
+
+    Q = jnp.concatenate(blocks, axis=0, dtype=orig_type)
+    if perm is not None:
+        Q = _unpermute(Q, perm)
+
+    return Q, quantize_params
+
+def pack_matrix(Q, params, contraction_axis=0, should_quantize = True):
+    scale = params['scale']
+    zero = params['zero']
+
+    expanded_scale = jnp.expand_dims(scale, axis=contraction_axis)
+    expanded_zero = jnp.expand_dims(zero, axis=contraction_axis)
+    if should_quantize:
+        int_matrix = jnp.round(Q / expanded_scale + expanded_zero).astype(jnp.uint8)
+        packed = pack_along_axis(contraction_axis, int_matrix, )
     else:
-        raise ValueError(f'Only float16 and float32 supported for out_type, got {out_type}')
-    """
+        int_matrix = Q
+        packed = int_matrix
 
-    # -----------------------------------------------------------
-    # Write back the block of the output matrix C wth masks.
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    return QuantizedMatrix(
+        int_weight=packed,
+        zero=zero,
+        scale=scale,
+        contraction_axis=contraction_axis
+    )
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=8),
-    ],
-    key=['M', 'N', 'K']#, 'out_type']
-)
-@triton.jit
-def matmul_4bit_quantized_transpose_b(
-    # Pointers to inputs
-    a_ptr, b_ptr, zeros_ptr, scales_ptr,
-    # Pointers to outputs
-    c_ptr,
-    # Matrix dimensions
-    M : tl.constexpr, N : tl.constexpr, K : tl.constexpr,
-    # The stride variables represent how much to increase the ptr by when moving by 1
-    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
-    # by to get the element one row down (A has M rows).
-    stride_am : tl.constexpr, stride_ak : tl.constexpr,
-    stride_bk : tl.constexpr, stride_bn : tl.constexpr,
-    stride_cm : tl.constexpr, stride_cn : tl.constexpr,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    """Adapted from from https://github.com/openai/triton/blob/main/python/tutorials/03-matrix-multiplication.py
-    Kernel for computing the matmul C = A x B, where B is an int32 matrix with each value consisting of 8 packed 4 bit values.
-    A has shape (M, K), B has shape (N, K) and C has shape (M, 2N)
-    """
+def unpack_matrix(weight):
+    if weight.int_weight.dtype == jnp.float32:
+        # 양자화되지 않은 경우, 그대로 반환한다.
+        return weight.int_weight
+    expanded_zero = jnp.expand_dims(weight.zero, axis=weight.contraction_axis)
+    expanded_scale = jnp.expand_dims(weight.scale, axis=weight.contraction_axis)
 
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
-    # See above `L2 Cache Optimizations` section for details.
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    unpacked = unpack_along_axis(weight.contraction_axis, weight.int_weight)
+    return (unpacked - expanded_zero) * expanded_scale
 
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K // 8, BLOCK_SIZE_N] pointers
-    # See above `Pointer Arithmetics` section for details
+def _pack(w_int):
+    assert len(w_int.shape) == 1
+    pack_dtype = jnp.uint8
+    ele_width = pack_dtype.dtype.itemsize * 8
+    bits = 4
+    vals_per_int = ele_width // bits
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    result = jnp.zeros(w_int.shape[0] // vals_per_int, dtype=pack_dtype)
 
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_bn[None, :] * stride_bn + offs_k[:, None] * stride_bk)
+    for offset in range(vals_per_int):
+        result = result | (w_int[offset::vals_per_int] << (bits * offset)).astype(pack_dtype)
+    print("_pack, gptq:252 return result : ", result)
+    return result
 
+def _unpack(packed):
 
-    zero_ptrs = zeros_ptr + offs_k[:, None]
-    scale_ptrs = scales_ptr + offs_k[:, None]
+    assert len(packed.shape) == 1
+    bits = 4
+    ele_width = packed.dtype.itemsize * 8
+    vals_per_int = ele_width // bits
+    result = jnp.zeros(packed.shape[0] * vals_per_int, dtype=jnp.uint8)
 
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
-    accumulator1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    accumulator2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    mask = (1 << bits) - 1
+    for offset in range(vals_per_int):
+        result = result.at[offset::vals_per_int].set(
+            jnp.uint8(packed >> (bits * offset) & mask)
+        )
+    return result
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
-        k_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
-        transposed_k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
-        a = tl.load(a_ptrs, mask=k_mask, other=0.0).to(tl.float32)
-        b = tl.load(b_ptrs, mask=transposed_k_mask, other=0.0)
+def vmap_all_but_one(f, axis):
+    @wraps(f)
+    def inner(arg):
+        n_dim = len(arg.shape)
+        if axis >= n_dim:
+            raise ValueError(f'Axis {axis} is out of bounds for array of dimension {n_dim}')
 
-        block_zeros =  tl.load(zero_ptrs, mask=transposed_k_mask, other=0.)
-        block_scales = tl.load(scale_ptrs, mask=transposed_k_mask, other=1.)
+        fn = f
+        vmap_dim = 1
+        for i in reversed(range(n_dim)):
+            if i == axis:
+                vmap_dim = 0
+            else:
+                fn = jax.vmap(fn, vmap_dim, vmap_dim)
+        return fn(arg)
+    return inner
 
-        b1_slice = ((b & 0xF).to(tl.float32) - block_zeros) * block_scales
-        b2_slice = ((b >> 4 ).to(tl.float32) - block_zeros) * block_scales
-
-        # We accumulate along the K dimension.
-        #accumulator1 += tl.sum(a[:, None, :] * b1_slice[None, :, :], axis=2)
-        #accumulator2 += tl.sum(a[:, None, :] * b2_slice[None, :, :], axis=2)
-        accumulator1 += tl.dot(a, b1_slice)
-        accumulator2 += tl.dot(a, b2_slice)
-
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-        zero_ptrs += BLOCK_SIZE_K
-        scale_ptrs += BLOCK_SIZE_K
-
-    c1 = accumulator1.to(tl.float16)
-    c2 = accumulator2.to(tl.float16)
-    """
-    if out_type == 'float16':
-        c = accumulator.to(tl.float16)
-    elif out_type == 'float32':
-        c = accumulator
+def pack_along_axis(axis, w):
+    if w.dtype == jnp.float32:
+        #float32 타입인 경우 패킹을 하지 않고 그대로 반환한다.
+        return w
     else:
-        raise ValueError(f'Only float16 and float32 supported for out_type, got {out_type}')
-    """
+        return vmap_all_but_one(_pack, axis)(w)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+def unpack_along_axis(axis, w):
+    return vmap_all_but_one(_unpack, axis)(w)
 
-    offs_cn = 2 * (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < 2 * N)
-    tl.store(c_ptrs, c1, mask=c_mask)
+pack_rowwise = jax.vmap(_pack)
+pack_colwise = jax.vmap(_pack, 1, out_axes=1)
 
-    offs_cn += 1
-    c_ptrs2 = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask2 = (offs_cm[:, None] < M) & (offs_cn[None, :] < 2 * N)
-    tl.store(c_ptrs2, c2, mask=c_mask2)
+unpack_rowwise = jax.vmap(_unpack)
+unpack_colwise = jax.vmap(_unpack, 1, out_axes=1)
